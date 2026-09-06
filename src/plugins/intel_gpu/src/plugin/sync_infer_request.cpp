@@ -47,13 +47,16 @@ bool same_host_mem(cldnn::memory::cptr memory, const uint8_t* host_ptr) {
     return device_ptr == host_ptr;
 }
 
+// A user tensor may legitimately be non-contiguous: an ROI view built with ov::Tensor(parent, begin, end)
+// points at the ROI origin but inherits the parent's strides. The host->device paths below treat user
+// memory as a flat blob, so such a tensor must be repacked first. Remote tensors are returned unchanged.
 std::shared_ptr<ov::ITensor> ensure_contiguous(const std::shared_ptr<ov::ITensor>& tensor) {
     if (std::dynamic_pointer_cast<ov::IRemoteTensor>(tensor) != nullptr || tensor->is_continuous()) {
         return tensor;
     }
 
     auto packed = ov::make_tensor(tensor->get_element_type(), tensor->get_shape());
-    tensor->copy_to(packed);
+    ov::intel_gpu::copy_strided(*tensor, *packed);
     return packed;
 }
 
@@ -1041,7 +1044,7 @@ std::vector<cldnn::event::ptr> SyncInferRequest::prepare_input(const std::string
     GPU_DEBUG_TRACE_DETAIL << "Prepare input for " << internal_name
                            << " (is_remote_tensor_impl ? " << is_remote_tensor_impl
                            << ", is_usm_host_tensor ? " << is_usm_host_tensor
-                           << ", is_repacked ? " << is_repacked 
+                           << ", is_repacked ? " << is_repacked
                            << ", is_generic_remote ? " << is_generic_remote << ")" << std::endl;
     GPU_DEBUG_TRACE_DETAIL << "    port shape       : " << pshape.to_string() << std::endl;
     GPU_DEBUG_TRACE_DETAIL << "    user_tensor shape: " << user_tensor->get_shape().to_string() << std::endl;

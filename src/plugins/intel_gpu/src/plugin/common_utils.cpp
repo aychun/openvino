@@ -14,6 +14,7 @@
 #include "openvino/op/util/op_types.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 
 namespace {
@@ -346,6 +347,48 @@ std::vector<cldnn::optional_data_type> get_output_data_types(const ov::Node* op,
         output_data_types.push_back(cldnn::element_type_to_data_type(type));
     }
     return output_data_types;
+}
+
+void copy_strided(const ov::ITensor& src, ov::ITensor& dst) {
+    OPENVINO_ASSERT(src.get_element_type() == dst.get_element_type() && src.get_shape() == dst.get_shape(),
+                    "[GPU] copy_strided expects tensors of the same element type and shape, got ",
+                    src.get_element_type(), src.get_shape(), " and ", dst.get_element_type(), dst.get_shape());
+    OPENVINO_ASSERT(src.get_element_type().bitwidth() >= 8, "[GPU] copy_strided does not support sub-byte element type ", src.get_element_type());
+
+    const auto& shape = src.get_shape();
+    const auto& src_strides = src.get_strides();
+    const auto& dst_strides = dst.get_strides();
+    auto packed_strides = ov::row_major_strides(shape);
+    for (auto& stride : packed_strides) {
+        stride *= src.get_element_type().size();
+    }
+
+    // Dims [outer, rank) are packed in both tensors, so together they form one run copied by a single memcpy
+    size_t outer = shape.size();
+    while (outer > 0 && src_strides[outer - 1] == packed_strides[outer - 1] && dst_strides[outer - 1] == packed_strides[outer - 1]) {
+        --outer;
+    }
+    const size_t total_bytes = src.get_byte_size();
+    const size_t run_bytes = outer == 0 ? total_bytes : packed_strides[outer - 1];
+
+    const auto* src_data = static_cast<const uint8_t*>(src.data());
+    auto* dst_data = static_cast<uint8_t*>(dst.data());
+    ov::Shape index(outer, 0);
+    size_t src_offset = 0;
+    size_t dst_offset = 0;
+    for (size_t copied = 0; copied < total_bytes; copied += run_bytes) {
+        std::memcpy(dst_data + dst_offset, src_data + src_offset, run_bytes);
+        for (size_t d = outer; d-- > 0;) {  // advance the outer-dims index like an odometer
+            src_offset += src_strides[d];
+            dst_offset += dst_strides[d];
+            if (++index[d] < shape[d]) {
+                break;
+            }
+            src_offset -= src_strides[d] * shape[d];
+            dst_offset -= dst_strides[d] * shape[d];
+            index[d] = 0;
+        }
+    }
 }
 
 }  // namespace ov::intel_gpu

@@ -148,6 +148,12 @@ void convert_and_copy(const cldnn::memory::ptr src, ov::ITensor* dst, const cldn
 void convert_and_copy(const ov::ITensor* src, ov::ITensor* dst, const cldnn::stream& stream);
 void convert_and_copy(const cldnn::memory::ptr src, cldnn::memory::ptr dst, cldnn::stream& stream);
 
+// Copies `src` into `dst` (same shape and element type) honoring arbitrary byte strides on either side, e.g. an
+// ROI view created with ov::Tensor(parent, begin, end). Innermost dimensions that are packed in both tensors
+// are copied as one memcpy per run, so a strided tensor costs about as much as a plain memcpy. Host tensors
+// only; sub-byte element types have no strides and are rejected.
+void copy_strided(const ov::ITensor& src, ov::ITensor& dst);
+
 }  // namespace intel_gpu
 
 inline std::ostream& operator<<(std::ostream& os, const ov::AnyMap& params) {

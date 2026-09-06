@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <algorithm>
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -21,6 +22,7 @@
 #include "common_test_utils/subgraph_builders/split_multi_conv_concat.hpp"
 #include "common_test_utils/subgraph_builders/read_concat_split_assign.hpp"
 #include "openvino/op/add.hpp"
+#include "openvino/op/convert.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/runtime/intel_gpu/ocl/ocl.hpp"
 #include "openvino/runtime/intel_gpu/ocl/ocl_wrapper.hpp"
@@ -501,6 +503,121 @@ TEST(TensorTest, smoke_canReallocateDeviceInputForHostTensor) {
     // Infer with host_tensor
     OV_ASSERT_NO_THROW(inf_req.set_input_tensor(host_tensor));
     OV_ASSERT_NO_THROW(inf_req.infer());
+}
+
+// An ROI view built with ov::Tensor(parent, begin, end) keeps the parent's strides, so it is not
+// contiguous. The plugin must consume it through its strides rather than as a flat blob.
+TEST(TensorTest, smoke_canInferWithNonContiguousInputTensor) {
+    auto core = ov::Core();
+    const ov::Shape parent_shape = {1, 3, 16, 16};
+    const ov::Shape roi_shape = {1, 3, 8, 8};
+    const std::vector<std::pair<ov::Coordinate, ov::Coordinate>> rois = {
+        {{0, 0, 4, 6}, {1, 3, 12, 14}},
+        {{0, 0, 0, 0}, {1, 3, 8, 8}},
+    };
+
+    // Give every parent element a distinct value so that a sheared read cannot pass by chance
+    ov::Tensor parent(ov::element::u8, parent_shape);
+    auto* parent_data = parent.data<uint8_t>();
+    for (size_t i = 0; i < parent.get_size(); ++i) {
+        parent_data[i] = static_cast<uint8_t>(i % 251);
+    }
+    const auto parent_strides = parent.get_strides();  // byte strides equal element strides for u8
+
+    for (const auto& input_pshape : {ov::PartialShape(roi_shape), ov::PartialShape{1, 3, -1, -1}}) {
+        auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, input_pshape);
+        auto convert = std::make_shared<ov::op::v0::Convert>(param, ov::element::f32);
+        auto result = std::make_shared<ov::op::v0::Result>(convert);
+        auto model = std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{param}, "ConvertModel");
+
+        auto compiled_model = core.compile_model(model, ov::test::utils::DEVICE_GPU);
+        auto request = compiled_model.create_infer_request();
+
+        for (const auto& [begin, end] : rois) {
+            auto roi = ov::Tensor(parent, begin, end);
+            ASSERT_EQ(roi.get_shape(), roi_shape);
+            ASSERT_FALSE(roi.is_continuous());
+
+            OV_ASSERT_NO_THROW(request.set_input_tensor(roi));
+            OV_ASSERT_NO_THROW(request.infer());
+
+            auto output = request.get_output_tensor();
+            ASSERT_EQ(output.get_shape(), roi_shape);
+            const auto* res = output.data<float>();
+
+            size_t idx = 0;
+            for (size_t n = begin[0]; n < end[0]; ++n) {
+                for (size_t c = begin[1]; c < end[1]; ++c) {
+                    for (size_t y = begin[2]; y < end[2]; ++y) {
+                        for (size_t x = begin[3]; x < end[3]; ++x, ++idx) {
+                            const auto ref = parent_data[n * parent_strides[0] + c * parent_strides[1] + y * parent_strides[2] + x * parent_strides[3]];
+                            ASSERT_EQ(res[idx], static_cast<float>(ref)) << "mismatch at [" << n << "," << c << "," << y << "," << x << "]";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The device->host copy of a result must honor the strides of a non-contiguous (ROI view) output tensor
+// and leave the rest of the parent tensor untouched.
+TEST(TensorTest, smoke_canInferWithNonContiguousOutputTensor) {
+    auto core = ov::Core();
+    const ov::Shape shape = {1, 3, 8, 8};
+    const ov::Shape parent_shape = {1, 3, 16, 16};
+    const ov::Coordinate begin = {0, 0, 4, 6};
+    const ov::Coordinate end = {1, 3, 12, 14};
+    const float untouched = -1.f;
+
+    ov::Tensor input(ov::element::u8, shape);
+    auto* input_data = input.data<uint8_t>();
+    for (size_t i = 0; i < input.get_size(); ++i) {
+        input_data[i] = static_cast<uint8_t>(i % 251);
+    }
+
+    for (const auto& input_pshape : {ov::PartialShape(shape), ov::PartialShape{1, 3, -1, -1}}) {
+        auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, input_pshape);
+        auto convert = std::make_shared<ov::op::v0::Convert>(param, ov::element::f32);
+        auto result = std::make_shared<ov::op::v0::Result>(convert);
+        auto model = std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{param}, "ConvertModel");
+
+        auto compiled_model = core.compile_model(model, ov::test::utils::DEVICE_GPU);
+        auto request = compiled_model.create_infer_request();
+
+        ov::Tensor parent(ov::element::f32, parent_shape);
+        std::fill_n(parent.data<float>(), parent.get_size(), untouched);
+        auto roi = ov::Tensor(parent, begin, end);
+        ASSERT_EQ(roi.get_shape(), shape);
+        ASSERT_FALSE(roi.is_continuous());
+
+        OV_ASSERT_NO_THROW(request.set_input_tensor(input));
+        OV_ASSERT_NO_THROW(request.set_output_tensor(roi));
+        OV_ASSERT_NO_THROW(request.infer());
+
+        // Walk the whole parent: inside the ROI the values must follow the input in row-major order, outside
+        // nothing may have been written
+        const auto* parent_data = parent.data<float>();
+        auto parent_strides = parent.get_strides();
+        for (auto& stride : parent_strides) {
+            stride /= sizeof(float);
+        }
+        size_t idx = 0;
+        for (size_t n = 0; n < parent_shape[0]; ++n) {
+            for (size_t c = 0; c < parent_shape[1]; ++c) {
+                for (size_t y = 0; y < parent_shape[2]; ++y) {
+                    for (size_t x = 0; x < parent_shape[3]; ++x) {
+                        const bool inside = n >= begin[0] && n < end[0] && c >= begin[1] && c < end[1] &&
+                                            y >= begin[2] && y < end[2] && x >= begin[3] && x < end[3];
+                        const float ref = inside ? static_cast<float>(input_data[idx++]) : untouched;
+                        const auto res = parent_data[n * parent_strides[0] + c * parent_strides[1] + y * parent_strides[2] + x * parent_strides[3]];
+                        ASSERT_EQ(res, ref) << (inside ? "wrong value inside" : "parent overwritten outside") << " the ROI at [" << n << "," << c << "," << y << "," << x << "]";
+                    }
+                }
+            }
+        }
+        ASSERT_EQ(idx, input.get_size());
+    }
 }
 
 TEST(VariablesTest, smoke_canSetStateTensor) {

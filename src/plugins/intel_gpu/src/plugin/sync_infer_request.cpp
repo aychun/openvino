@@ -619,7 +619,15 @@ void SyncInferRequest::wait() {
                 if (!same_mem && output_memory->size()) {
                     GPU_DEBUG_TRACE_DETAIL << internal_name << " with index " << port_idx << " copy from: " << output_memory->buffer_ptr() << " to "
                         << (!is_remote_tensor_impl ? output_tensor->data() : remote_tensor_impl_ptr->get_original_memory_buf_ptr()) << std::endl;
-                    if (auto ev = copy_output_data(output_memory, *output_tensor)) {
+                    if (!output_tensor->is_continuous()) {
+                        // A strided user tensor (e.g. an ROI view) cannot take the flat device->host copy: land the
+                        // result in contiguous storage first, then scatter it through the user's strides
+                        auto packed = ov::make_tensor(output_tensor->get_element_type(), output_tensor->get_shape());
+                        if (auto ev = copy_output_data(output_memory, *packed)) {
+                            network.get_stream().wait_for_events({ev});
+                        }
+                        copy_strided(*packed, *output_tensor);
+                    } else if (auto ev = copy_output_data(output_memory, *output_tensor)) {
                         copy_events.push_back(ev);
                     }
                 }
@@ -740,9 +748,11 @@ TensorWrapper SyncInferRequest::create_or_share_device_tensor(const TensorWrappe
     auto usm_host_raw_ptr = engine.get_device_info().dev_type == cldnn::device_type::integrated_gpu &&
                             user_tensor_mem_type == cldnn::allocation_type::usm_host;
 
+    // A strided user tensor cannot be shared with the device as a flat buffer
     bool can_share = !is_convert_required(user_tensor->get_element_type(), element_type)
                      && can_use_usm_host(engine, total_output_bytes)
-                     && !generic_remote_tensor;
+                     && !generic_remote_tensor
+                     && user_tensor->is_continuous();
 
     if (usm_host_tensor && can_share && m_context == usm_host_tensor->get_impl()->get_context()) {
         return { usm_host_tensor->get_impl(), user_tensor_wrapper.owner };

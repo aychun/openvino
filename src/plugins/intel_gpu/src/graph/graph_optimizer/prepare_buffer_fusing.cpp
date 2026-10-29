@@ -199,7 +199,14 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
                 return false;
         }
 
-        if (pred.first->get_preferred_impl_type() == impl_types::onednn) {
+        // Other users of the input read it from the concat buffer, i.e. with padding along the concat axis.
+        // oneDNN memory descriptors don't carry that padding, so such users have the same limits as a oneDNN input.
+        const auto& pred_users = pred.first->get_users();
+        const bool read_by_onednn = std::any_of(pred_users.begin(), pred_users.end(), [](const program_node* user) {
+            return !user->is_type<concatenation>() && user->get_preferred_impl_type() == impl_types::onednn;
+        });
+
+        if (pred.first->get_preferred_impl_type() == impl_types::onednn || read_by_onednn) {
             // No implicit concat for spatial axes
             if (concat_axis > 1)
                 return false;
@@ -209,7 +216,9 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
                 if (onednn_byte_offset % 64 != 0)
                     return false;
             }
+        }
 
+        if (pred.first->get_preferred_impl_type() == impl_types::onednn) {
             for (const auto& fused_op : pred_params[idx].fused_desc) {
                 auto add_type = onednn_eltwise_fusing_helpers::get_add_fusing_type(*pred.first, fused_op);
                 if (add_type == add_fusing_type::sum)
@@ -220,6 +229,8 @@ bool concat_in_place_optimization::match(const program_node& concat_node,
             if (!pred.first->can_be_optimized())
                 is_onednn_impl = true;
         }
+        if (read_by_onednn)
+            is_onednn_impl = true;
         const auto& input_padd = pred.first->get_output_layout().data_padding;
 
         // Check that there isn't already some padding between inputs in concat axis.

@@ -148,6 +148,9 @@ struct convolution_onednn : typed_primitive_onednn_impl<convolution> {
 private:
     int _zero_point_mask;
     dnnl::memory::data_type _wzp_data_type = dnnl::memory::data_type::undef;
+    // s32 copy of the activations zero points and the memory it was made from, see get_arguments()
+    mutable memory::ptr _a_zp_src;
+    mutable memory::ptr _a_zp_s32;
 
 protected:
     std::unique_ptr<primitive_impl> clone() const override {
@@ -172,12 +175,14 @@ protected:
         if (instance.activations_zero_points_term()) {
             auto a_zp = instance.activations_zero_points_memory();
 
-            // In the case of dynamic model, if choose_impl was executed in runtime,
-            // a_zp could be remained as u8 or i8.
+            // oneDNN takes s32 zero points. Convert this instance's data here rather than in create(): the impl may be a
+            // clone from the implementations cache, created for another node with equal params.
             if (a_zp->get_layout().data_type != data_types::i32) {
-                const auto& conv_node = instance.get_node().as<convolution>();
-                auto& a_zp_node = conv_node.activations_zero_points().as<data>();
-                a_zp = a_zp_node.get_attached_memory_ptr();
+                if (_a_zp_src != a_zp) {
+                    _a_zp_s32 = onednn::convert_zp_data_to_s32(a_zp);
+                    _a_zp_src = a_zp;
+                }
+                a_zp = _a_zp_s32;
             }
 
             dnnl::memory::desc desc = onednn::layout_to_memory_desc_flatten(a_zp->get_layout(), dnnl::memory::format_tag::a);
@@ -207,13 +212,13 @@ protected:
         _wzp_data_type = data_type;
     }
 
+    // Only reads the node: convolutions can share one zero points node (ConstantsReduce) and compile_graph creates
+    // their impls in parallel. get_arguments() converts the data to s32.
     template <typename T>
     static void set_activation_zero_points_attr(const std::shared_ptr<dnnl::primitive_attr>& attrs,
                                                 cldnn::data_node& node, int& zero_point_mask) {
         int32_t zp_val = DNNL_RUNTIME_S32_VAL;
         bool is_per_tensor = onednn::is_per_tensor<T>(node, zp_val);
-        memory::ptr s32_mem = onednn::convert_zp_data_to_s32(node.get_attached_memory_ptr());
-        node.attach_memory(s32_mem, false);
         zero_point_mask = is_per_tensor ? 0 : 2;
         attrs->set_zero_points_mask(DNNL_ARG_SRC, zero_point_mask);
     }

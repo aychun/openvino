@@ -17,6 +17,45 @@
 using namespace cldnn;
 
 namespace {
+// oneDNN gets a padded input as a dense memory descriptor plus a base offset (onednn::get_offset),
+// and gpu_buffer::get_onednn_memory() ignores that offset. So feature padding can be read only
+// when the input is one contiguous, 64-byte aligned slice of a USM buffer.
+bool onednn_can_read_feature_padding(const layout& l, const engine& eng) {
+    if (!eng.use_unified_shared_memory() || l.batch() > 1)
+        return false;
+
+    // The slice is contiguous only if feature is the outermost dim after batch,
+    // and a blocked feature dim must start at a block boundary.
+    const auto& dims_order = l.format.dims_order();
+    auto outer_dim = std::find_if(dims_order.begin(), dims_order.end(), [](size_t dim) {
+        return dim != 0;
+    });
+    if (outer_dim == dims_order.end() || *outer_dim != 1)
+        return false;
+
+    const auto lower_f = l.data_padding._lower_size[1];
+    for (const auto& block : l.format.block_sizes()) {
+        if (block.first != 1 || lower_f % block.second != 0)
+            return false;
+    }
+
+    // Same offset as onednn::get_offset()
+    int64_t offset = lower_f;
+    for (size_t i = 0; i < l.get_spatial_rank(); ++i) {
+        offset *= l.spatial(i);
+    }
+    const auto offset_bits = offset * static_cast<int64_t>(ov::element::Type(l.data_type).bitwidth());
+    return offset_bits % (64 * 8) == 0;
+}
+
+// Users that are optimized out share this node's buffer and rely on its padding.
+bool has_in_place_user(const program_node& node) {
+    const auto& users = node.get_users();
+    return std::any_of(users.begin(), users.end(), [](const program_node* user) {
+        return user->can_be_optimized();
+    });
+}
+
 void eliminate_pad_for_onednn_impl(program& p, program_node& node) {
     // Padded offsets aren't supported by onednn kernels
     bool has_paddings = false;
@@ -75,12 +114,20 @@ void eliminate_pad_for_onednn_impl(program& p, program_node& node) {
                     batch_padding = false;
                 }
 
-                if (spatial_padding || batch_padding) {
+                // Feature padding is fine for ocl kernels, so it's removed only for nodes that run oneDNN.
+                // Dynamic shapes keep it, as before.
+                const bool unreadable_feature_padding = feature_padding && in_layout.is_static() && !in_padding.is_dynamic() &&
+                                                        node.get_preferred_impl_type() == impl_types::onednn &&
+                                                        !onednn_can_read_feature_padding(in_layout, p.get_engine());
+
+                if (spatial_padding || batch_padding || unreadable_feature_padding) {
                     cldnn::layout layout_wo_padding = in_layout;
                     layout_wo_padding.data_padding = cldnn::padding{};
-                    layout_wo_padding.data_padding._lower_size[1] = in_layout.data_padding._lower_size[1];
-                    layout_wo_padding.data_padding._upper_size[1] = in_layout.data_padding._upper_size[1];
-                    if (input.is_type<reorder>()) {
+                    if (!unreadable_feature_padding) {
+                        layout_wo_padding.data_padding._lower_size[1] = in_layout.data_padding._lower_size[1];
+                        layout_wo_padding.data_padding._upper_size[1] = in_layout.data_padding._upper_size[1];
+                    }
+                    if (input.is_type<reorder>() && !has_in_place_user(input)) {
                         input.set_output_padding(padding());
                         input.set_output_layout(layout_wo_padding, false, port);
                     } else {
@@ -89,8 +136,6 @@ void eliminate_pad_for_onednn_impl(program& p, program_node& node) {
                         p.add_intermediate(new_reorder_node, node, idx);
                         new_reorder_node.recalc_output_layouts(false);
                     }
-                } else {
-                    return;
                 }
             }
         }

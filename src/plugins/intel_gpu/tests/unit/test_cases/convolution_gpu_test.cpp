@@ -11264,6 +11264,101 @@ TEST(convolution_gpu_onednn, support_activation_zero_points_for_i32) {
         }
 }
 
+namespace {
+// u8 input, i8 weights, stride 1, no padding, no bias: out = sum((in - a_zp[ic]) * w)
+VVVVF<float> reference_conv_u8s8_activation_zp(const VVVVF<uint8_t>& in, const VVVVF<int8_t>& w, const std::vector<uint8_t>& a_zp) {
+    const size_t b_size = in.size(), ic_size = in[0].size(), y_in = in[0][0].size(), x_in = in[0][0][0].size();
+    const size_t oc_size = w.size(), ky_size = w[0][0].size(), kx_size = w[0][0][0].size();
+    const size_t y_out = y_in - ky_size + 1, x_out = x_in - kx_size + 1;
+    VVVVF<float> out(b_size, VVVF<float>(oc_size, VVF<float>(y_out, VF<float>(x_out, 0.f))));
+    for (size_t b = 0; b < b_size; ++b)
+        for (size_t oc = 0; oc < oc_size; ++oc)
+            for (size_t y = 0; y < y_out; ++y)
+                for (size_t x = 0; x < x_out; ++x) {
+                    int32_t acc = 0;
+                    for (size_t ic = 0; ic < ic_size; ++ic)
+                        for (size_t ky = 0; ky < ky_size; ++ky)
+                            for (size_t kx = 0; kx < kx_size; ++kx)
+                                acc += (static_cast<int32_t>(in[b][ic][y + ky][x + kx]) - static_cast<int32_t>(a_zp[ic])) *
+                                       static_cast<int32_t>(w[oc][ic][ky][kx]);
+                    out[b][oc][y][x] = static_cast<float>(acc);
+                }
+    return out;
+}
+
+// oneDNN convolutions with equal params that read the same u8 input. conv_a_zp[i] is the id of the activation zero
+// points of convolution i, so they can have different zero points or share one zero points node.
+void test_onednn_convolutions_activation_zero_points(const std::map<std::string, std::vector<uint8_t>>& a_zp_values,
+                                                     const std::vector<std::string>& conv_a_zp,
+                                                     bool is_dynamic,
+                                                     const std::vector<int64_t>& batches,
+                                                     bool is_caching_test) {
+    auto& engine = get_test_engine();
+    tests::random_generator rg("onednn_convolutions_activation_zero_points");
+
+    const int64_t ifm = 16, ofm = 16, k = 3, spatial = 6;
+    auto weights_data = rg.generate_random_4d<int8_t>(ofm, ifm, k, k, -4, 4, 1);
+    auto weights = engine.allocate_memory({{ofm, ifm, k, k}, data_types::i8, format::bfyx});
+    set_values(weights, flatten_4d(format::bfyx, weights_data));
+
+    const auto batch_dim = is_dynamic ? ov::Dimension::dynamic() : ov::Dimension(batches[0]);
+    topology topology(input_layout("input", layout{ov::PartialShape{batch_dim, ifm, spatial, spatial}, data_types::u8, format::bfyx}),
+                      data("weights", weights));
+    for (const auto& [id, values] : a_zp_values) {
+        auto a_zp = engine.allocate_memory({{1, ifm, 1, 1}, data_types::u8, format::bfyx});
+        set_values(a_zp, values);
+        topology.add(data(id, a_zp));
+    }
+    for (size_t i = 0; i < conv_a_zp.size(); ++i) {
+        const auto conv_id = "conv" + std::to_string(i);
+        topology.add(convolution(conv_id, input_info("input"), "weights", "", "", conv_a_zp[i], "", 1, {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, data_types::f32));
+        topology.add(reorder("out" + std::to_string(i), input_info(conv_id), format::bfyx, data_types::f32));
+    }
+
+    // No forced impls: the layout optimizer chooses oneDNN for these convolutions, as in the plugin (checked below)
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    auto network = get_network(engine, topology, config, get_test_stream_ptr(), is_caching_test);
+
+    for (auto batch : batches) {
+        auto input_data = rg.generate_random_4d<uint8_t>(batch, ifm, spatial, spatial, 0, 15, 1);
+        auto input = engine.allocate_memory({{batch, ifm, spatial, spatial}, data_types::u8, format::bfyx});
+        set_values(input, flatten_4d(format::bfyx, input_data));
+        network->set_input_data("input", input);
+        auto outputs = network->execute();
+
+        for (size_t i = 0; i < conv_a_zp.size(); ++i) {
+            auto impl = network->get_primitive("conv" + std::to_string(i))->get_impl();
+            ASSERT_NE(impl, nullptr);
+            ASSERT_TRUE(impl->is_onednn());
+
+            auto reference = reference_conv_u8s8_activation_zp(input_data, weights_data, a_zp_values.at(conv_a_zp[i]));
+            auto expected = flatten_4d(format::bfyx, reference);
+            auto output_memory = outputs.at("out" + std::to_string(i)).get_memory();
+            cldnn::mem_lock<float, mem_lock_type::read> output_ptr(output_memory, get_test_stream());
+            ASSERT_EQ(output_memory->get_layout().get_linear_size(), expected.size());
+            for (size_t j = 0; j < expected.size(); ++j) {
+                ASSERT_NEAR(expected[j], output_ptr[j], 1e-5f) << "conv" << i << " batch " << batch << " index " << j;
+            }
+        }
+    }
+}
+}  // namespace
+
+// A dynamic convolution can get its oneDNN impl from the implementations cache, created there for another convolution
+// with equal params. It must still use its own activation zero points.
+TEST(convolution_gpu_onednn, activation_zero_points_with_impl_from_cache) {
+    if (!get_test_engine().get_device_info().supports_immad)
+        GTEST_SKIP();
+
+    test_onednn_convolutions_activation_zero_points({{"a_zp0", std::vector<uint8_t>(16, 3)}, {"a_zp1", std::vector<uint8_t>(16, 7)}},
+                                                    {"a_zp0", "a_zp1"},
+                                                    true,
+                                                    {1, 2},
+                                                    false);
+}
+
 TEST(convolution_gpu_onednn, eltw_and_bin_double_shift_in_blob_cache) {
     auto& engine = get_test_engine();
     auto stream_ptr = get_test_stream_ptr();

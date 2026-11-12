@@ -11359,6 +11359,32 @@ TEST(convolution_gpu_onednn, activation_zero_points_with_impl_from_cache) {
                                                     false);
 }
 
+// Equal zero points of several convolutions can be one data node (ConstantsReduce), and their impls are created in
+// parallel. Per channel values, so the zero point mask is 2.
+TEST(convolution_gpu_onednn, activation_zero_points_shared_by_convolutions) {
+    if (!get_test_engine().get_device_info().supports_immad)
+        GTEST_SKIP();
+
+    std::vector<uint8_t> a_zp(16);
+    for (size_t i = 0; i < a_zp.size(); ++i)
+        a_zp[i] = static_cast<uint8_t>(i % 8);
+    // Creating the impls used to race on the shared node and crash or hang in about one of twenty builds, so build it
+    // many times (about 15 ms each)
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_NO_FATAL_FAILURE(test_onednn_convolutions_activation_zero_points({{"a_zp", a_zp}}, std::vector<std::string>(8, "a_zp"), false, {1}, false));
+    }
+}
+
+TEST(convolution_gpu_onednn, activation_zero_points_shared_by_convolutions_cached) {
+    if (!get_test_engine().get_device_info().supports_immad)
+        GTEST_SKIP();
+
+    std::vector<uint8_t> a_zp(16);
+    for (size_t i = 0; i < a_zp.size(); ++i)
+        a_zp[i] = static_cast<uint8_t>(i % 8);
+    test_onednn_convolutions_activation_zero_points({{"a_zp", a_zp}}, std::vector<std::string>(8, "a_zp"), false, {1}, true);
+}
+
 TEST(convolution_gpu_onednn, eltw_and_bin_double_shift_in_blob_cache) {
     auto& engine = get_test_engine();
     auto stream_ptr = get_test_stream_ptr();

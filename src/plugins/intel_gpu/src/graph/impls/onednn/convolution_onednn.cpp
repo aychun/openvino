@@ -19,6 +19,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
 namespace cldnn {
 namespace onednn {
 
@@ -139,6 +142,36 @@ static std::shared_ptr<dnnl::convolution_forward::primitive_desc> get_convolutio
                                                                        attr);
 }
 
+// Returns an s32 copy of activations zero points, in device memory if the data is there (program::transfer_memory_to_device).
+// The instances that read the same data share one copy: convolutions can share one zero points node (ConstantsReduce), and
+// the networks of a compiled model share constants. Only weak references are kept here, so a copy lives as long as an
+// impl uses it.
+static memory::ptr get_s32_zero_points(const memory::ptr& a_zp, network& net) {
+    static std::mutex mutex;
+    static std::unordered_map<const memory*, std::pair<std::weak_ptr<memory>, std::weak_ptr<memory>>> copies;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = copies.find(a_zp.get());
+    if (it != copies.end() && it->second.first.lock() == a_zp) {
+        if (auto a_zp_s32 = it->second.second.lock()) {
+            return a_zp_s32;
+        }
+    }
+
+    auto a_zp_s32 = onednn::convert_zp_data_to_s32(a_zp);
+    if (a_zp->get_allocation_type() == allocation_type::usm_device && a_zp_s32->get_allocation_type() != allocation_type::usm_device) {
+        auto device_mem = net.get_engine().allocate_memory(a_zp_s32->get_layout(), allocation_type::usm_device, false);
+        device_mem->copy_from(net.get_stream(), *a_zp_s32, true);
+        a_zp_s32 = device_mem;
+    }
+
+    for (auto i = copies.begin(); i != copies.end();) {
+        i = (i->second.first.expired() || i->second.second.expired()) ? copies.erase(i) : std::next(i);
+    }
+    copies[a_zp.get()] = {a_zp, a_zp_s32};
+    return a_zp_s32;
+}
+
 struct convolution_onednn : typed_primitive_onednn_impl<convolution> {
     using parent = typed_primitive_onednn_impl<convolution>;
     using parent::parent;
@@ -175,12 +208,11 @@ protected:
         if (instance.activations_zero_points_term()) {
             auto a_zp = instance.activations_zero_points_memory();
 
-            // oneDNN takes s32 zero points. create() converts the zero points of the node it is called for, but the
-            // impl may be a clone from the implementations cache, created for another node with equal params. Convert
-            // the data this instance reads.
+            // oneDNN takes s32 zero points. Convert this instance's data here rather than in create(): the impl may be a
+            // clone from the implementations cache, created for another node with equal params.
             if (a_zp->get_layout().data_type != data_types::i32) {
                 if (_a_zp_src != a_zp) {
-                    _a_zp_s32 = onednn::convert_zp_data_to_s32(a_zp);
+                    _a_zp_s32 = get_s32_zero_points(a_zp, instance.get_network());
                     _a_zp_src = a_zp;
                 }
                 a_zp = _a_zp_s32;
@@ -213,13 +245,13 @@ protected:
         _wzp_data_type = data_type;
     }
 
+    // Only reads the node: convolutions can share one zero points node (ConstantsReduce) and compile_graph creates
+    // their impls in parallel. get_arguments() converts the data to s32.
     template <typename T>
     static void set_activation_zero_points_attr(const std::shared_ptr<dnnl::primitive_attr>& attrs,
                                                 cldnn::data_node& node, int& zero_point_mask) {
         int32_t zp_val = DNNL_RUNTIME_S32_VAL;
         bool is_per_tensor = onednn::is_per_tensor<T>(node, zp_val);
-        memory::ptr s32_mem = onednn::convert_zp_data_to_s32(node.get_attached_memory_ptr());
-        node.attach_memory(s32_mem, false);
         zero_point_mask = is_per_tensor ? 0 : 2;
         attrs->set_zero_points_mask(DNNL_ARG_SRC, zero_point_mask);
     }

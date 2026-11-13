@@ -176,7 +176,16 @@ protected:
             // impl may be a clone from the implementations cache, created for another node with equal params.
             if (a_zp->get_layout().data_type != data_types::i32) {
                 if (!instance.activations_zero_points_s32_memory()) {
-                    instance.set_activations_zero_points_s32_memory(onednn::convert_zp_data_to_s32(a_zp));
+                    auto a_zp_s32 = onednn::convert_zp_data_to_s32(a_zp);
+                    // convert_zp_data_to_s32() returns host-accessible memory, and the copy is read on every execution:
+                    // keep it in device memory when the data is there (network::transfer_memory_to_device)
+                    if (a_zp->get_allocation_type() == allocation_type::usm_device && a_zp_s32->get_allocation_type() != allocation_type::usm_device) {
+                        auto& network = instance.get_network();
+                        auto device_mem = network.get_engine().allocate_memory(a_zp_s32->get_layout(), allocation_type::usm_device, false);
+                        device_mem->copy_from(network.get_stream(), *a_zp_s32, true);
+                        a_zp_s32 = std::move(device_mem);
+                    }
+                    instance.set_activations_zero_points_s32_memory(std::move(a_zp_s32));
                 }
                 a_zp = instance.activations_zero_points_s32_memory();
             }
